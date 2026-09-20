@@ -106,17 +106,6 @@ const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 20, standardHea
 const contactLimiter = rateLimit({ windowMs: 60 * 60 * 1000, limit: 5, standardHeaders: true, legacyHeaders: false, message: { error: "Too many messages sent. Please try again later." } });
 const apiLimiter = rateLimit({ windowMs: 60 * 1000, limit: 240, standardHeaders: true, legacyHeaders: false });
 app.use("/api", apiLimiter);
-/* Temporary diagnostic: shows why the database can't be reached (no secrets are returned) */
-app.get("/api/health", async (req, res) => {
-  const out = {
-    hasDatabaseUrl: !!DB.url,
-    usingVariable: DB.name,
-    envNames: Object.keys(process.env).filter((k) => /^(DATABASE|POSTGRES|NEON|STORAGE)/i.test(k)),
-  };
-  try { await pool.query("select 1"); await ensureSchema(); out.database = "ok"; }
-  catch (e) { out.database = "error"; out.code = e.code || null; out.message = String(e.message).slice(0, 160); }
-  res.status(out.database === "ok" ? 200 : 500).json(out);
-});
 app.use("/api", async (req, res, next) => { await ensureSchema(); next(); });
 
 /* Block cross-site writes: mutating requests must be JSON and same-origin */
