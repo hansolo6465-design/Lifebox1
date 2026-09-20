@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="theme-color" content="#090b10" />
+  <meta name="robots" content="noindex" />
+  <title>Dashboard — LifeBox</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/app.css" />
+</head>
+<body>
+  <div class="shell" id="shell">
+    <aside class="sidebar">
+      <a class="brand" href="/"><span class="brand-mark">L</span> LIFEBOX</a>
+      <nav class="side-nav" id="sideNav" aria-label="Main"></nav>
+      <div class="side-user">
+        <button class="user-chip" data-route="settings" id="userChip"><span class="avatar" id="avatarSide">?</span><span><b id="userNameSide"></b><small id="userEmailSide"></small></span></button>
+        <button class="btn btn-ghost btn-small" id="logoutBtn" type="button">Log out</button>
+      </div>
+    </aside>
+
+    <div class="main-col">
+      <header class="topbar">
+        <a class="brand" href="/"><span class="brand-mark">L</span> LIFEBOX</a>
+        <div class="topbar-title" id="topTitle"></div>
+        <div class="topbar-actions">
+          <button class="btn btn-primary btn-small" id="addBtn" type="button"></button>
+          <button class="avatar avatar-btn" id="avatarTop" data-route="settings" aria-label="Account settings">?</button>
+        </div>
+      </header>
+      <main id="view" tabindex="-1"><div class="loading">Loading your LifeBox…</div></main>
+    </div>
+
+    <nav class="bottom-nav" id="bottomNav" aria-label="Main"></nav>
+  </div>
+
+  <div class="sheet-backdrop" id="sheetBackdrop" hidden>
+    <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="sheetTitle" id="sheet"></div>
+  </div>
+  <div class="toast-wrap" id="toasts" aria-live="polite"></div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
