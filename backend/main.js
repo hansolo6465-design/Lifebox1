@@ -12,8 +12,19 @@ const nodemailer = require("nodemailer");
 const IS_PROD = process.env.NODE_ENV === "production";
 
 /* ---------- Database (PostgreSQL) ---------- */
-if (!process.env.DATABASE_URL) console.error("DATABASE_URL is not set. Add your Postgres connection string.");
-const pool = new Pool({ connectionString: process.env.DATABASE_URL, max: 3, idleTimeoutMillis: 10000 });
+/* Find the connection string: DATABASE_URL first, otherwise any variable holding a postgres:// URL
+   (Vercel's Neon integration can name it POSTGRES_URL, STORAGE_URL, etc.) */
+function resolveDatabase() {
+  const isPg = (v) => typeof v === "string" && /^postgres(ql)?:\/\//i.test(v.trim());
+  for (const k of ["DATABASE_URL", "POSTGRES_URL", "STORAGE_URL", "NEON_URL"]) if (isPg(process.env[k])) return { name: k, url: process.env[k].trim() };
+  const all = Object.keys(process.env).filter((k) => isPg(process.env[k])).sort();
+  const pooled = all.filter((k) => !/UNPOOL|NON_POOL/i.test(k));
+  const k = pooled[0] || all[0];
+  return k ? { name: k, url: process.env[k].trim() } : { name: null, url: undefined };
+}
+const DB = resolveDatabase();
+if (!DB.url) console.error("No Postgres connection string found. Add DATABASE_URL in Vercel.");
+const pool = new Pool({ connectionString: DB.url, max: 3, idleTimeoutMillis: 10000 });
 pool.on("error", (e) => console.error("DB pool error:", e.message));
 const query = (text, params) => pool.query(text, params);
 
@@ -98,7 +109,8 @@ app.use("/api", apiLimiter);
 /* Temporary diagnostic: shows why the database can't be reached (no secrets are returned) */
 app.get("/api/health", async (req, res) => {
   const out = {
-    hasDatabaseUrl: !!process.env.DATABASE_URL,
+    hasDatabaseUrl: !!DB.url,
+    usingVariable: DB.name,
     envNames: Object.keys(process.env).filter((k) => /^(DATABASE|POSTGRES|NEON|STORAGE)/i.test(k)),
   };
   try { await pool.query("select 1"); await ensureSchema(); out.database = "ok"; }
