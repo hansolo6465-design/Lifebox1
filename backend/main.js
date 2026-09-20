@@ -1,74 +1,75 @@
 "use strict";
 const path = require("path");
-const fs = require("fs");
 const crypto = require("crypto");
+try { process.loadEnvFile(path.join(__dirname, "..", ".env")); } catch {}
 const express = require("express");
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
 const bcrypt = require("bcryptjs");
-const Database = require("better-sqlite3");
+const { Pool } = require("pg");
 const nodemailer = require("nodemailer");
 
-try { process.loadEnvFile(path.join(__dirname, ".env")); } catch {}
-const PORT = process.env.PORT || 3000;
 const IS_PROD = process.env.NODE_ENV === "production";
-const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
-fs.mkdirSync(DATA_DIR, { recursive: true });
 
-/* ---------- Database ---------- */
-const db = new Database(path.join(DATA_DIR, "lifebox.db"));
-db.pragma("journal_mode = WAL");
-db.pragma("foreign_keys = ON");
-db.exec(`
+/* ---------- Database (PostgreSQL) ---------- */
+if (!process.env.DATABASE_URL) console.error("DATABASE_URL is not set. Add your Postgres connection string.");
+const pool = new Pool({ connectionString: process.env.DATABASE_URL, max: 3, idleTimeoutMillis: 10000 });
+pool.on("error", (e) => console.error("DB pool error:", e.message));
+const query = (text, params) => pool.query(text, params);
+
+const SCHEMA = `
 CREATE TABLE IF NOT EXISTS users(
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id SERIAL PRIMARY KEY,
   name TEXT NOT NULL,
   email TEXT NOT NULL UNIQUE,
   password_hash TEXT NOT NULL,
   currency TEXT NOT NULL DEFAULT 'INR',
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE TABLE IF NOT EXISTS sessions(
   token_hash TEXT PRIMARY KEY,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  expires_at INTEGER NOT NULL
+  expires_at BIGINT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS items(
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id SERIAL PRIMARY KEY,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   name TEXT NOT NULL, category TEXT NOT NULL DEFAULT 'Other',
-  purchase_date TEXT, price REAL, store TEXT, serial TEXT,
+  purchase_date TEXT, price DOUBLE PRECISION, store TEXT, serial TEXT,
   warranty_expiry TEXT, notes TEXT,
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE TABLE IF NOT EXISTS subscriptions(
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id SERIAL PRIMARY KEY,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  name TEXT NOT NULL, amount REAL NOT NULL DEFAULT 0,
+  name TEXT NOT NULL, amount DOUBLE PRECISION NOT NULL DEFAULT 0,
   cycle TEXT NOT NULL DEFAULT 'monthly', next_date TEXT NOT NULL,
   category TEXT NOT NULL DEFAULT 'Other', status TEXT NOT NULL DEFAULT 'active', notes TEXT,
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE TABLE IF NOT EXISTS reminders(
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id SERIAL PRIMARY KEY,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   title TEXT NOT NULL, due_date TEXT NOT NULL, repeat TEXT NOT NULL DEFAULT 'none',
-  notes TEXT, done INTEGER NOT NULL DEFAULT 0,
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  notes TEXT, done SMALLINT NOT NULL DEFAULT 0,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE TABLE IF NOT EXISTS messages(
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id SERIAL PRIMARY KEY,
   name TEXT NOT NULL, email TEXT NOT NULL, message TEXT NOT NULL, ip TEXT,
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_items_user ON items(user_id);
 CREATE INDEX IF NOT EXISTS idx_subs_user ON subscriptions(user_id);
 CREATE INDEX IF NOT EXISTS idx_rem_user ON reminders(user_id);
-`);
+CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+`;
+let schemaReady = null;
+const ensureSchema = () => (schemaReady ||= pool.query(SCHEMA).catch((e) => { schemaReady = null; throw e; }));
 
 /* ---------- App setup ---------- */
 const app = express();
-if (process.env.TRUST_PROXY) app.set("trust proxy", Number(process.env.TRUST_PROXY) || 1);
+if (process.env.TRUST_PROXY || process.env.VERCEL) app.set("trust proxy", Number(process.env.TRUST_PROXY) || 1);
 app.disable("x-powered-by");
 app.use(
   helmet({
@@ -94,6 +95,7 @@ const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 20, standardHea
 const contactLimiter = rateLimit({ windowMs: 60 * 60 * 1000, limit: 5, standardHeaders: true, legacyHeaders: false, message: { error: "Too many messages sent. Please try again later." } });
 const apiLimiter = rateLimit({ windowMs: 60 * 1000, limit: 240, standardHeaders: true, legacyHeaders: false });
 app.use("/api", apiLimiter);
+app.use("/api", async (req, res, next) => { await ensureSchema(); next(); });
 
 /* Block cross-site writes: mutating requests must be JSON and same-origin */
 app.use("/api", (req, res, next) => {
@@ -119,32 +121,34 @@ function setSessionCookie(res, token, maxAgeMs) {
   if (IS_PROD) parts.push("Secure");
   res.setHeader("Set-Cookie", parts.join("; "));
 }
-function createSession(res, userId) {
+async function createSession(res, userId) {
   const token = crypto.randomBytes(32).toString("hex");
   const ms = SESSION_DAYS * 86400000;
-  db.prepare("INSERT INTO sessions(token_hash,user_id,expires_at) VALUES(?,?,?)").run(sha(token), userId, Date.now() + ms);
+  await query("INSERT INTO sessions(token_hash,user_id,expires_at) VALUES($1,$2,$3)", [sha(token), userId, Date.now() + ms]);
   setSessionCookie(res, token, ms);
+  query("DELETE FROM sessions WHERE expires_at < $1", [Date.now()]).catch(() => {});
 }
-function getUser(req) {
+async function getUser(req) {
   const token = parseCookies(req.headers.cookie)[COOKIE];
   if (!token) return null;
-  const row = db
-    .prepare("SELECT u.id,u.name,u.email,u.currency,s.expires_at FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=?")
-    .get(sha(token));
+  const { rows } = await query(
+    "SELECT u.id,u.name,u.email,u.currency,s.expires_at FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=$1",
+    [sha(token)]
+  );
+  const row = rows[0];
   if (!row) return null;
-  if (row.expires_at < Date.now()) {
-    db.prepare("DELETE FROM sessions WHERE token_hash=?").run(sha(token));
+  if (Number(row.expires_at) < Date.now()) {
+    await query("DELETE FROM sessions WHERE token_hash=$1", [sha(token)]);
     return null;
   }
   return { id: row.id, name: row.name, email: row.email, currency: row.currency };
 }
-function requireAuth(req, res, next) {
-  const user = getUser(req);
+async function requireAuth(req, res, next) {
+  const user = await getUser(req);
   if (!user) return res.status(401).json({ error: "Please log in." });
   req.user = user;
   next();
 }
-setInterval(() => db.prepare("DELETE FROM sessions WHERE expires_at < ?").run(Date.now()), 3600000).unref();
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -153,71 +157,77 @@ const str = (v, max) => (typeof v === "string" ? v.trim().slice(0, max) : "");
 const validDate = (v) => DATE_RE.test(v) && !Number.isNaN(Date.parse(v + "T00:00:00Z"));
 
 /* ---------- Auth routes ---------- */
-app.post("/api/auth/register", authLimiter, (req, res) => {
+app.post("/api/auth/register", authLimiter, async (req, res) => {
   const name = str(req.body.name, 80);
   const email = str(req.body.email, 200).toLowerCase();
   const password = typeof req.body.password === "string" ? req.body.password : "";
   if (!name) return res.status(400).json({ error: "Enter your name." });
   if (!EMAIL_RE.test(email)) return res.status(400).json({ error: "Enter a valid email address." });
   if (password.length < 8 || password.length > 128) return res.status(400).json({ error: "Password must be 8 to 128 characters." });
-  if (db.prepare("SELECT 1 FROM users WHERE email=?").get(email)) return res.status(409).json({ error: "An account with this email already exists. Log in instead." });
-  const hash = bcrypt.hashSync(password, 12);
-  const info = db.prepare("INSERT INTO users(name,email,password_hash) VALUES(?,?,?)").run(name, email, hash);
-  createSession(res, info.lastInsertRowid);
-  res.status(201).json({ user: { id: info.lastInsertRowid, name, email, currency: "INR" } });
+  const hash = await bcrypt.hash(password, 12);
+  let id;
+  try {
+    const r = await query("INSERT INTO users(name,email,password_hash) VALUES($1,$2,$3) RETURNING id", [name, email, hash]);
+    id = r.rows[0].id;
+  } catch (e) {
+    if (e.code === "23505") return res.status(409).json({ error: "An account with this email already exists. Log in instead." });
+    throw e;
+  }
+  await createSession(res, id);
+  res.status(201).json({ user: { id, name, email, currency: "INR" } });
 });
 
 const DUMMY_HASH = bcrypt.hashSync("dummy-password-for-timing", 12);
-app.post("/api/auth/login", authLimiter, (req, res) => {
+app.post("/api/auth/login", authLimiter, async (req, res) => {
   const email = str(req.body.email, 200).toLowerCase();
   const password = typeof req.body.password === "string" ? req.body.password : "";
-  const row = db.prepare("SELECT * FROM users WHERE email=?").get(email);
-  const ok = bcrypt.compareSync(password, row ? row.password_hash : DUMMY_HASH);
+  const { rows } = await query("SELECT * FROM users WHERE email=$1", [email]);
+  const row = rows[0];
+  const ok = await bcrypt.compare(password, row ? row.password_hash : DUMMY_HASH);
   if (!row || !ok) return res.status(401).json({ error: "Email or password is incorrect." });
-  createSession(res, row.id);
+  await createSession(res, row.id);
   res.json({ user: { id: row.id, name: row.name, email: row.email, currency: row.currency } });
 });
 
-app.post("/api/auth/logout", (req, res) => {
+app.post("/api/auth/logout", async (req, res) => {
   const token = parseCookies(req.headers.cookie)[COOKIE];
-  if (token) db.prepare("DELETE FROM sessions WHERE token_hash=?").run(sha(token));
+  if (token) await query("DELETE FROM sessions WHERE token_hash=$1", [sha(token)]);
   setSessionCookie(res, "", 0);
   res.json({ ok: true });
 });
 
-app.get("/api/auth/me", (req, res) => {
-  const user = getUser(req);
+app.get("/api/auth/me", async (req, res) => {
+  const user = await getUser(req);
   if (!user) return res.status(401).json({ error: "Not logged in." });
   res.json({ user });
 });
 
-app.patch("/api/auth/profile", requireAuth, (req, res) => {
+app.patch("/api/auth/profile", requireAuth, async (req, res) => {
   const name = str(req.body.name, 80);
   const currency = str(req.body.currency, 3).toUpperCase();
   if (!name) return res.status(400).json({ error: "Enter your name." });
   if (!CURRENCIES.includes(currency)) return res.status(400).json({ error: "Choose a supported currency." });
-  db.prepare("UPDATE users SET name=?, currency=? WHERE id=?").run(name, currency, req.user.id);
+  await query("UPDATE users SET name=$1, currency=$2 WHERE id=$3", [name, currency, req.user.id]);
   res.json({ user: { ...req.user, name, currency } });
 });
 
-app.post("/api/auth/password", requireAuth, authLimiter, (req, res) => {
+app.post("/api/auth/password", requireAuth, authLimiter, async (req, res) => {
   const { current, next } = req.body;
   if (typeof current !== "string" || typeof next !== "string") return res.status(400).json({ error: "Fill in both password fields." });
   if (next.length < 8 || next.length > 128) return res.status(400).json({ error: "New password must be 8 to 128 characters." });
-  const row = db.prepare("SELECT password_hash FROM users WHERE id=?").get(req.user.id);
-  if (!bcrypt.compareSync(current, row.password_hash)) return res.status(401).json({ error: "Current password is incorrect." });
-  db.prepare("UPDATE users SET password_hash=? WHERE id=?").run(bcrypt.hashSync(next, 12), req.user.id);
-  // sign out every other device, keep this one
+  const { rows } = await query("SELECT password_hash FROM users WHERE id=$1", [req.user.id]);
+  if (!(await bcrypt.compare(current, rows[0].password_hash))) return res.status(401).json({ error: "Current password is incorrect." });
+  await query("UPDATE users SET password_hash=$1 WHERE id=$2", [await bcrypt.hash(next, 12), req.user.id]);
   const token = parseCookies(req.headers.cookie)[COOKIE];
-  db.prepare("DELETE FROM sessions WHERE user_id=? AND token_hash<>?").run(req.user.id, sha(token));
+  await query("DELETE FROM sessions WHERE user_id=$1 AND token_hash<>$2", [req.user.id, sha(token)]);
   res.json({ ok: true });
 });
 
-app.delete("/api/auth/account", requireAuth, authLimiter, (req, res) => {
+app.delete("/api/auth/account", requireAuth, authLimiter, async (req, res) => {
   const password = typeof req.body?.password === "string" ? req.body.password : "";
-  const row = db.prepare("SELECT password_hash FROM users WHERE id=?").get(req.user.id);
-  if (!bcrypt.compareSync(password, row.password_hash)) return res.status(401).json({ error: "Password is incorrect." });
-  db.prepare("DELETE FROM users WHERE id=?").run(req.user.id);
+  const { rows } = await query("SELECT password_hash FROM users WHERE id=$1", [req.user.id]);
+  if (!(await bcrypt.compare(password, rows[0].password_hash))) return res.status(401).json({ error: "Password is incorrect." });
+  await query("DELETE FROM users WHERE id=$1", [req.user.id]);
   setSessionCookie(res, "", 0);
   res.json({ ok: true });
 });
@@ -307,46 +317,54 @@ for (const [route, spec] of Object.entries(RESOURCES)) {
   const keys = Object.keys(spec.fields);
   const t = spec.table;
 
-  app.post(`/api/${route}`, requireAuth, (req, res) => {
+  app.post(`/api/${route}`, requireAuth, async (req, res) => {
     const r = parseBody(spec, req.body || {});
     if (r.error) return res.status(400).json({ error: r.error });
-    const count = db.prepare(`SELECT COUNT(*) c FROM ${t} WHERE user_id=?`).get(req.user.id).c;
+    const count = (await query(`SELECT COUNT(*)::int c FROM ${t} WHERE user_id=$1`, [req.user.id])).rows[0].c;
     if (count >= 2000) return res.status(400).json({ error: "Limit reached for this list." });
-    const info = db
-      .prepare(`INSERT INTO ${t}(user_id,${keys.join(",")}) VALUES(?,${keys.map(() => "?").join(",")})`)
-      .run(req.user.id, ...keys.map((k) => r.value[k]));
-    res.status(201).json(db.prepare(`SELECT * FROM ${t} WHERE id=?`).get(info.lastInsertRowid));
+    const { rows } = await query(
+      `INSERT INTO ${t}(user_id,${keys.join(",")}) VALUES($1,${keys.map((_, i) => `$${i + 2}`).join(",")}) RETURNING *`,
+      [req.user.id, ...keys.map((k) => r.value[k])]
+    );
+    res.status(201).json(rows[0]);
   });
 
-  app.put(`/api/${route}/:id`, requireAuth, (req, res) => {
+  app.put(`/api/${route}/:id`, requireAuth, async (req, res) => {
     const id = Number(req.params.id);
+    if (!Number.isInteger(id)) return res.status(404).json({ error: "Not found." });
     const r = parseBody(spec, req.body || {});
     if (r.error) return res.status(400).json({ error: r.error });
-    const info = db
-      .prepare(`UPDATE ${t} SET ${keys.map((k) => `${k}=?`).join(",")} WHERE id=? AND user_id=?`)
-      .run(...keys.map((k) => r.value[k]), id, req.user.id);
-    if (!info.changes) return res.status(404).json({ error: "Not found." });
-    res.json(db.prepare(`SELECT * FROM ${t} WHERE id=?`).get(id));
+    const { rows } = await query(
+      `UPDATE ${t} SET ${keys.map((k, i) => `${k}=$${i + 1}`).join(",")} WHERE id=$${keys.length + 1} AND user_id=$${keys.length + 2} RETURNING *`,
+      [...keys.map((k) => r.value[k]), id, req.user.id]
+    );
+    if (!rows.length) return res.status(404).json({ error: "Not found." });
+    res.json(rows[0]);
   });
 
-  app.delete(`/api/${route}/:id`, requireAuth, (req, res) => {
-    const info = db.prepare(`DELETE FROM ${t} WHERE id=? AND user_id=?`).run(Number(req.params.id), req.user.id);
-    if (!info.changes) return res.status(404).json({ error: "Not found." });
+  app.delete(`/api/${route}/:id`, requireAuth, async (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) return res.status(404).json({ error: "Not found." });
+    const r = await query(`DELETE FROM ${t} WHERE id=$1 AND user_id=$2`, [id, req.user.id]);
+    if (!r.rowCount) return res.status(404).json({ error: "Not found." });
     res.json({ ok: true });
   });
 }
 
-function allData(userId) {
-  return {
-    items: db.prepare("SELECT * FROM items WHERE user_id=? ORDER BY id DESC").all(userId),
-    subscriptions: db.prepare("SELECT * FROM subscriptions WHERE user_id=? ORDER BY id DESC").all(userId),
-    reminders: db.prepare("SELECT * FROM reminders WHERE user_id=? ORDER BY due_date ASC").all(userId),
-  };
+async function allData(userId) {
+  const [items, subscriptions, reminders] = await Promise.all([
+    query("SELECT * FROM items WHERE user_id=$1 ORDER BY id DESC", [userId]),
+    query("SELECT * FROM subscriptions WHERE user_id=$1 ORDER BY id DESC", [userId]),
+    query("SELECT * FROM reminders WHERE user_id=$1 ORDER BY due_date ASC", [userId]),
+  ]);
+  return { items: items.rows, subscriptions: subscriptions.rows, reminders: reminders.rows };
 }
-app.get("/api/data", requireAuth, (req, res) => res.json({ ...allData(req.user.id), meta: { itemCategories: ITEM_CATEGORIES, subCategories: SUB_CATEGORIES, currencies: CURRENCIES } }));
-app.get("/api/export", requireAuth, (req, res) => {
+app.get("/api/data", requireAuth, async (req, res) => {
+  res.json({ ...(await allData(req.user.id)), meta: { itemCategories: ITEM_CATEGORIES, subCategories: SUB_CATEGORIES, currencies: CURRENCIES } });
+});
+app.get("/api/export", requireAuth, async (req, res) => {
   res.setHeader("Content-Disposition", 'attachment; filename="lifebox-export.json"');
-  res.json({ exportedAt: new Date().toISOString(), user: req.user, ...allData(req.user.id) });
+  res.json({ exportedAt: new Date().toISOString(), user: req.user, ...(await allData(req.user.id)) });
 });
 
 /* ---------- Contact form ---------- */
@@ -367,36 +385,32 @@ app.post("/api/contact", contactLimiter, async (req, res) => {
   if (!name) return res.status(400).json({ error: "Enter your name." });
   if (!EMAIL_RE.test(email)) return res.status(400).json({ error: "Enter a valid email address." });
   if (message.length < 5) return res.status(400).json({ error: "Write a short message." });
-  db.prepare("INSERT INTO messages(name,email,message,ip) VALUES(?,?,?,?)").run(name, email, message, req.ip);
+  await query("INSERT INTO messages(name,email,message,ip) VALUES($1,$2,$3,$4)", [name, email, message, req.ip]);
   if (mailer && process.env.OWNER_EMAIL) {
-    mailer
-      .sendMail({
+    // must finish before responding: serverless functions freeze once the response is sent
+    try {
+      await mailer.sendMail({
         from: process.env.MAIL_FROM || process.env.SMTP_USER,
         to: process.env.OWNER_EMAIL,
         replyTo: `"${name.replace(/["\r\n]/g, "")}" <${email}>`,
         subject: `LifeBox contact: ${name.replace(/[\r\n]/g, " ")}`,
         text: `From: ${name} <${email}>\n\n${message}`,
-      })
-      .catch((e) => console.error("Contact email failed:", e.message));
+      });
+    } catch (e) { console.error("Contact email failed:", e.message); }
   }
   res.status(201).json({ ok: true });
 });
 
-app.get("/api/admin/messages", (req, res) => {
+app.get("/api/admin/messages", async (req, res) => {
   const token = process.env.ADMIN_TOKEN;
   const given = req.get("x-admin-token") || "";
   const ok = token && given.length === token.length && crypto.timingSafeEqual(Buffer.from(given), Buffer.from(token));
   if (!ok) return res.status(401).json({ error: "Unauthorized." });
-  res.json(db.prepare("SELECT * FROM messages ORDER BY id DESC LIMIT 500").all());
+  res.json((await query("SELECT * FROM messages ORDER BY id DESC LIMIT 500")).rows);
 });
 
-/* ---------- Pages ---------- */
-app.get("/dashboard", (req, res) => {
-  if (!getUser(req)) return res.redirect("/?login=1");
-  res.setHeader("Cache-Control", "no-store");
-  res.sendFile(path.join(__dirname, "views", "dashboard.html"));
-});
-app.use(express.static(path.join(__dirname, "public"), { extensions: ["html"] }));
+/* ---------- Static files (Vercel serves /public itself; this is for local use) ---------- */
+app.use(express.static(path.join(__dirname, "..", "public"), { extensions: ["html"] }));
 app.use("/api", (req, res) => res.status(404).json({ error: "Not found." }));
 app.use((err, req, res, next) => {
   if (err.type === "entity.parse.failed") return res.status(400).json({ error: "Invalid request." });
@@ -404,4 +418,4 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: "Something went wrong. Please try again." });
 });
 
-app.listen(PORT, () => console.log(`LifeBox running on http://localhost:${PORT}`));
+module.exports = app;

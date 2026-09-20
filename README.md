@@ -1,42 +1,30 @@
 # LifeBox 📦
 
 Warranties, belongings, subscriptions and reminders in one private dashboard.
+Runs on Vercel with a free Neon PostgreSQL database.
 
-## Run it on your computer
-Requires Node.js 20.12 or newer.
+## Files
+- `public/` static pages: `index.html` (landing), `dashboard.html`, `app.js`, `app.css`, `style.css`, `script.js`
+- `backend/main.js` the API (accounts, belongings, subscriptions, reminders, contact form)
+- `api/index.js` connects the API to Vercel
+- `dev.js` local development only
+- `vercel.json` routing
 
-```bash
+## Deploy on Vercel
+1. Push this folder to a GitHub repository.
+2. On vercel.com choose Add New > Project, import the repo, and leave every setting as it is. Deploy.
+3. In the project: Storage > Create Database > Neon > connect it to the project. This adds `DATABASE_URL` automatically.
+4. Optional, for emailed contact messages: Settings > Environment Variables, add `OWNER_EMAIL`, `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`.
+5. Deployments > Redeploy so the new variables take effect.
+
+Tables are created automatically the first time the site is used.
+
+## Reading contact messages
+Open your Neon dashboard > SQL Editor and run `select * from messages order by id desc;`
+
+## Run locally
+Needs Node 20.12+ and a Postgres URL in `.env` (copy `.env.example`).
+```
 npm install
 npm start
 ```
-Open http://localhost:3000 and create an account.
-
-## What's inside
-| Feature | Where |
-|---|---|
-| Register / log in / log out | `server.js` (`/api/auth/*`), passwords hashed with bcrypt, sessions in HttpOnly cookies |
-| Dashboard, belongings, warranties, subscriptions, reminders, settings | `views/dashboard.html`, `public/app.js`, `public/app.css` |
-| Landing page + contact form | `public/index.html`, `public/style.css`, `public/script.js` |
-| Database | SQLite file at `data/lifebox.db` (created automatically) |
-
-Every record is tied to the logged-in user on the server, so accounts can never see each other's data.
-
-## Contact form
-Messages are always saved to the database. Read them with:
-```bash
-npm run messages
-```
-To also receive each one by email, copy `.env.example` to `.env` and fill in `OWNER_EMAIL` and the `SMTP_*` values (Gmail works with an App Password).
-
-## Put it online
-This app needs a host that runs Node.js **and keeps a disk** (the database is a file).
-Good fits: Render (add a Disk), Railway (add a Volume), Fly.io (Volume), or any VPS.
-Serverless hosts like Vercel or Netlify will NOT keep the SQLite file.
-
-Set these environment variables on the host:
-- `NODE_ENV=production`
-- `TRUST_PROXY=1`
-- `DATA_DIR=` the path of your persistent disk
-- `OWNER_EMAIL`, `SMTP_*` (optional, for email delivery)
-
-Start command: `npm start`. Back up the `data/` folder regularly.

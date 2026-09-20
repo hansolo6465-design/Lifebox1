@@ -2,21 +2,20 @@
   "name": "lifebox",
   "version": "1.0.0",
   "description": "LifeBox: warranties, subscriptions, belongings and reminders in one dashboard",
-  "main": "server.js",
+  "main": "dev.js",
   "private": true,
   "engines": {
     "node": ">=20.12"
   },
   "scripts": {
-    "start": "node server.js",
-    "messages": "node scripts/messages.js"
+    "start": "node dev.js"
   },
   "dependencies": {
     "bcryptjs": "^3.0.3",
-    "better-sqlite3": "^13.0.3",
     "express": "^5.2.1",
     "express-rate-limit": "^8.7.0",
     "helmet": "^8.3.0",
-    "nodemailer": "^10.0.10"
+    "nodemailer": "^10.0.10",
+    "pg": "^8.23.0"
   }
 }
