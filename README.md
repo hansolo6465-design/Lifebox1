@@ -1,3 +1,6 @@
+## 📸 Website Preview
+
+![LifeBox Website Preview](2252abcdddc17e756227a550f043dc1c9a71753f0c5ecc14f35b20335a29f1f4.png)
 # LifeBox 📦
 
 Warranties, belongings, subscriptions and reminders in one private dashboard.
